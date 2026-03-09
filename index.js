@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Events, Partials, ActivityType, ApplicationCommandType, REST, Routes } = require('discord.js');
-const { Pool } = require('pg');
+const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
 
@@ -19,6 +19,7 @@ try {
 const config = {
   ...configFile,
   token: process.env.DISCORD_TOKEN || configFile.token,
+  startingNumber: process.env.STARTING_NUMBER ? parseInt(process.env.STARTING_NUMBER, 10) : (configFile.startingNumber ?? 2000),
   skipRoleIds: process.env.SKIP_ROLE_IDS
     ? process.env.SKIP_ROLE_IDS.split(',').map(id => id.trim()).filter(Boolean)
     : (configFile.skipRoleIds || []),
@@ -96,16 +97,16 @@ function createWarningEmbed(title, description, fields = [], user = null) {
   return createEmbed('warning', `⚠️ ${title}`, description, fields, null, user);
 }
 
-// Create PostgreSQL connection pool
-const pool = new Pool({
+// Create MariaDB connection pool
+const pool = mysql.createPool({
   host: config.database.host,
-  port: config.database.port,
+  port: config.database.port || 3306,
   database: config.database.database,
   user: config.database.user,
   password: config.database.password,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  waitForConnections: true,
+  connectionLimit: 20,
+  queueLimit: 0,
 });
 
 // Create Discord client with necessary intents
@@ -461,7 +462,7 @@ function stopStatusCycling() {
 
 // ===== MEMBER NUMBERING =====
 let memberNumbers = new Map();
-let nextNumber = 1;
+let nextNumber = config.startingNumber;
 
 
 
@@ -469,14 +470,14 @@ let nextNumber = 1;
 async function validateNextNumber() {
   try {
     if (memberNumbers.size === 0) {
-      nextNumber = 1;
-      console.log('No members found, setting nextNumber to 1');
+      nextNumber = config.startingNumber;
+      console.log(`No members found, setting nextNumber to ${config.startingNumber}`);
       await updateNextNumberInDatabase();
       return;
     }
 
     const highestExisting = Math.max(...Array.from(memberNumbers.values()));
-    const expectedNext = highestExisting + 1;
+    const expectedNext = Math.max(highestExisting + 1, config.startingNumber);
 
     if (nextNumber !== expectedNext) {
       console.log(`🔧 Correcting nextNumber from ${nextNumber} to ${expectedNext}`);
@@ -492,85 +493,73 @@ async function validateNextNumber() {
 
 // ===== DATABASE FUNCTIONS =====
 async function initializeDatabase() {
-  let dbClient;
   try {
-    dbClient = await pool.connect();
-
     // Create member_numbers table
-    await dbClient.query(`
+    await pool.execute(`
       CREATE TABLE IF NOT EXISTS member_numbers (
-        id SERIAL PRIMARY KEY,
+        id INT AUTO_INCREMENT PRIMARY KEY,
         member_id VARCHAR(20) UNIQUE NOT NULL,
-        member_number INTEGER NOT NULL,
+        member_number INT NOT NULL,
         username VARCHAR(32) NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
 
     // Create bot_state table
-    await dbClient.query(`
+    await pool.execute(`
       CREATE TABLE IF NOT EXISTS bot_state (
-        id SERIAL PRIMARY KEY,
-        key VARCHAR(50) UNIQUE NOT NULL,
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        \`key\` VARCHAR(50) UNIQUE NOT NULL,
         value TEXT NOT NULL,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
 
-    // Ensure next_number row exists (upsert handles both new and existing)
-    await dbClient.query(`
-      INSERT INTO bot_state (key, value, updated_at)
-      VALUES ('next_number', '1', CURRENT_TIMESTAMP)
-      ON CONFLICT (key) DO NOTHING
-    `);
+    // Ensure next_number row exists
+    await pool.execute(`
+      INSERT IGNORE INTO bot_state (\`key\`, value, updated_at)
+      VALUES ('next_number', ?, CURRENT_TIMESTAMP)
+    `, [config.startingNumber.toString()]);
 
     console.log('Database initialized successfully');
   } catch (error) {
     console.error('Error initializing database:', error);
     process.exit(1);
-  } finally {
-    dbClient?.release();
   }
 }
 
 // Load existing member numbers from database
 async function loadMemberNumbers() {
-  let dbClient;
   try {
-    dbClient = await pool.connect();
-    const memberResult = await dbClient.query(
+    const [rows] = await pool.execute(
       'SELECT member_id, member_number, username FROM member_numbers ORDER BY member_number'
     );
 
     memberNumbers.clear();
-    let highestNumber = 0;
+    let highestNumber = config.startingNumber - 1;
 
-    memberResult.rows.forEach(row => {
+    rows.forEach(row => {
       memberNumbers.set(row.member_id, row.member_number);
       if (row.member_number > highestNumber) {
         highestNumber = row.member_number;
       }
     });
 
-    nextNumber = highestNumber + 1;
+    nextNumber = Math.max(highestNumber + 1, config.startingNumber);
     console.log(`Loaded ${memberNumbers.size} members, nextNumber: ${nextNumber}`);
 
     // Validate and correct if needed
     await validateNextNumber();
   } catch (error) {
     console.error('Error loading member numbers:', error);
-  } finally {
-    dbClient?.release();
   }
 }
 
 // Load stored usernames and update nicknames for existing members
 async function loadStoredUsernames() {
-  let dbClient;
   try {
-    dbClient = await pool.connect();
-    const usernameResult = await dbClient.query(
+    const [rows] = await pool.execute(
       'SELECT member_id, member_number, username FROM member_numbers ORDER BY member_number'
     );
     
@@ -582,7 +571,7 @@ async function loadStoredUsernames() {
     
     let updatedCount = 0;
     
-    for (const row of usernameResult.rows) {
+    for (const row of rows) {
       try {
         const guildMember = await guild.members.fetch(row.member_id).catch(() => null);
         if (guildMember) {
@@ -621,82 +610,63 @@ async function loadStoredUsernames() {
     }
   } catch (error) {
     console.error('Error loading stored usernames:', error);
-  } finally {
-    dbClient?.release();
   }
 }
 
 // Save member number to database
 async function saveMemberNumberToDatabase(memberId, number, username) {
-  let dbClient;
   try {
-    dbClient = await pool.connect();
-    await dbClient.query(`
+    await pool.execute(`
       INSERT INTO member_numbers (member_id, member_number, username) 
-      VALUES ($1, $2, $3)
-      ON CONFLICT (member_id) 
-      DO UPDATE SET 
-        member_number = $2, 
-        username = $3, 
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE 
+        member_number = VALUES(member_number), 
+        username = VALUES(username), 
         updated_at = CURRENT_TIMESTAMP
     `, [memberId, number, username]);
   } catch (error) {
     console.error('Error saving member number:', error);
-  } finally {
-    dbClient?.release();
   }
 }
 
 // Update user information in database
 async function updateUserInDatabase(memberId, number, username) {
-  let dbClient;
   try {
-    dbClient = await pool.connect();
-    await dbClient.query(`
+    await pool.execute(`
       UPDATE member_numbers 
       SET 
-        member_number = $2, 
-        username = $3, 
+        member_number = ?, 
+        username = ?, 
         updated_at = CURRENT_TIMESTAMP
-      WHERE member_id = $1
-    `, [memberId, number, username]);
+      WHERE member_id = ?
+    `, [number, username, memberId]);
   } catch (error) {
     console.error('Error updating user information:', error);
-  } finally {
-    dbClient?.release();
   }
 }
 
 // Update next number in database (upsert handles both insert and update)
 async function updateNextNumberInDatabase() {
-  let dbClient;
   try {
-    dbClient = await pool.connect();
-    await dbClient.query(`
-      INSERT INTO bot_state (key, value, updated_at)
-      VALUES ('next_number', $1, CURRENT_TIMESTAMP)
-      ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP
+    await pool.execute(`
+      INSERT INTO bot_state (\`key\`, value, updated_at)
+      VALUES ('next_number', ?, CURRENT_TIMESTAMP)
+      ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = CURRENT_TIMESTAMP
     `, [nextNumber.toString()]);
   } catch (error) {
     console.error('Error updating next number in database:', error);
-  } finally {
-    dbClient?.release();
   }
 }
 
 // Remove member number from database
 async function removeMemberNumberFromDatabase(memberId) {
-  let dbClient;
   try {
-    dbClient = await pool.connect();
-    await dbClient.query(
-      'DELETE FROM member_numbers WHERE member_id = $1',
+    await pool.execute(
+      'DELETE FROM member_numbers WHERE member_id = ?',
       [memberId]
     );
   } catch (error) {
     console.error('Error removing member number:', error);
-  } finally {
-    dbClient?.release();
   }
 }
 
@@ -784,20 +754,16 @@ async function assignNumberToMember(member) {
       
       // Get stored username from database if it exists
       let storedUsername = member.user.username;
-      let dbClient;
       try {
-        dbClient = await pool.connect();
-        const result = await dbClient.query(
-          'SELECT username FROM member_numbers WHERE member_id = $1',
+        const [rows] = await pool.execute(
+          'SELECT username FROM member_numbers WHERE member_id = ?',
           [member.id]
         );
-        if (result.rows.length > 0) {
-          storedUsername = result.rows[0].username;
+        if (rows.length > 0) {
+          storedUsername = rows[0].username;
         }
       } catch (error) {
         console.error(`Error fetching stored username for ${member.user.tag}:`, error);
-      } finally {
-        dbClient?.release();
       }
       
       const expectedNickname = `${existingNumber} | ${storedUsername}`;
@@ -1458,20 +1424,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
                
                // Get stored username from database
                let storedUsername = currentUsername;
-               let dbClient;
                try {
-                 dbClient = await pool.connect();
-                 const result = await dbClient.query(
-                   'SELECT username FROM member_numbers WHERE member_id = $1',
+                 const [rows] = await pool.execute(
+                   'SELECT username FROM member_numbers WHERE member_id = ?',
                    [editUser.id]
                  );
-                 if (result.rows.length > 0) {
-                   storedUsername = result.rows[0].username;
+                 if (rows.length > 0) {
+                   storedUsername = rows[0].username;
                  }
                } catch (error) {
                  console.error(`Error fetching stored username for ${editUser.tag}:`, error);
-               } finally {
-                 dbClient?.release();
                }
                
                const infoEmbed = createInfoEmbed(
