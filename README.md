@@ -53,7 +53,7 @@ A Discord bot that automatically assigns sequential badge numbers to members wit
 
 ```bash
 git clone https://github.com/daaruski/numbering-bot.git
-cd lsrp-number-bot
+cd numbering-bot
 ```
 
 ### 2. Install dependencies
