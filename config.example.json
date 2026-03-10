@@ -1,0 +1,66 @@
+{
+  "startingNumber": 2000,
+  "clientId": "YOUR_DISCORD_APPLICATION_ID",
+  "guildId": "YOUR_DISCORD_GUILD_ID",
+  "numberingRoleId": "ROLE_ID_FOR_NUMBERING",
+  "skipRoleIds": [],
+  "reservedNumbers": [2000, 3000],
+  "status": {
+    "cycleInterval": 5000,
+    "presets": [
+      {
+        "text": "LSRP",
+        "type": "Playing"
+      },
+      {
+        "text": "Next: #{nextNumber}",
+        "type": "Watching"
+      }
+    ]
+  },
+  "rateLimit": {
+    "enabled": true,
+    "maxCommands": 10,
+    "windowMs": 60000,
+    "exemptCommands": ["ping", "health"]
+  },
+  "rolePermissions": {
+    "director": "ROLE_ID_DIRECTOR",
+    "management": "ROLE_ID_MANAGEMENT",
+    "admin": "ROLE_ID_ADMIN",
+    "moderator": "ROLE_ID_MODERATOR"
+  },
+  "welcomeMessage": {
+    "enabled": true,
+    "embed": {
+      "color": "d46815",
+      "title": "📌 Welcome!",
+      "description": "Hello **{username}**, welcome to our community!",
+      "fields": [
+        {
+          "name": "🆔 Your Badge Number",
+          "value": "**{badgeNumber}**",
+          "inline": true
+        },
+        {
+          "name": "📋 What is this number?",
+          "value": "Your badge number is a unique identifier for your membership. Use it when contacting staff for support.",
+          "inline": false
+        },
+        {
+          "name": "💡 Important",
+          "value": "• Set your FiveM name to **{badgeNumber} | {username}**\n• Your number stays with you as long as you're a member",
+          "inline": false
+        }
+      ],
+      "footer": {
+        "text": "Thank you for joining!"
+      },
+      "thumbnail": "",
+      "image": ""
+    },
+    "sendToNewMembers": true,
+    "sendToExistingMembers": true,
+    "delayBeforeSending": 1000
+  }
+}

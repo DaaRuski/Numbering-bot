@@ -24,12 +24,12 @@ const config = {
     ? process.env.SKIP_ROLE_IDS.split(',').map(id => id.trim()).filter(Boolean)
     : (configFile.skipRoleIds || []),
   database: {
-    ...configFile.database,
-    host: process.env.DATABASE_HOST || configFile.database.host,
-    port: parseInt(process.env.DATABASE_PORT || configFile.database.port, 10),
-    database: process.env.DATABASE_NAME || configFile.database.database,
-    user: process.env.DATABASE_USER || configFile.database.user,
-    password: process.env.DATABASE_PASSWORD || configFile.database.password
+    ...(configFile.database || {}),
+    host: process.env.DATABASE_HOST || configFile.database?.host || 'localhost',
+    port: parseInt(process.env.DATABASE_PORT || configFile.database?.port || '3306', 10),
+    database: process.env.DATABASE_NAME || configFile.database?.database || 'lsrp_bot',
+    user: process.env.DATABASE_USER || configFile.database?.user || 'root',
+    password: process.env.DATABASE_PASSWORD || configFile.database?.password
   }
 };
 
@@ -51,6 +51,46 @@ if (skipRoleIds.length === 0) {
 // NOTE: This bot automatically skips guild owners due to permission limitations.
 // Guild owners cannot have their nicknames modified by bots, so they are excluded
 // from all nickname operations and number assignments.
+
+// ===== RATE LIMITING =====
+const rateLimitConfig = config.rateLimit || { enabled: true, maxCommands: 10, windowMs: 60000 };
+const rateLimitExempt = new Set(config.rateLimit?.exemptCommands || ['ping']);
+const userCommandTimestamps = new Map();
+
+function isRateLimited(userId, commandName) {
+  if (!rateLimitConfig.enabled) return false;
+  if (rateLimitExempt.has(commandName)) return false;
+
+  const now = Date.now();
+  const windowMs = rateLimitConfig.windowMs || 60000;
+  const maxCommands = rateLimitConfig.maxCommands || 10;
+
+  let timestamps = userCommandTimestamps.get(userId);
+  if (!timestamps) {
+    userCommandTimestamps.set(userId, [now]);
+    return false;
+  }
+
+  timestamps = timestamps.filter(t => now - t < windowMs);
+  if (timestamps.length >= maxCommands) {
+    const oldest = timestamps[0];
+    const retryAfter = Math.ceil((oldest + windowMs - now) / 1000);
+    return { retryAfter };
+  }
+  timestamps.push(now);
+  userCommandTimestamps.set(userId, timestamps);
+  return false;
+}
+
+// Clean up old entries periodically
+setInterval(() => {
+  const cutoff = Date.now() - (rateLimitConfig.windowMs || 60000);
+  for (const [userId, timestamps] of userCommandTimestamps.entries()) {
+    const filtered = timestamps.filter(t => t > cutoff);
+    if (filtered.length === 0) userCommandTimestamps.delete(userId);
+    else userCommandTimestamps.set(userId, filtered);
+  }
+}, 60000);
 
 // ===== EMBED HELPER FUNCTIONS =====
 function createEmbed(type, title, description, fields = [], color = null, user = null) {
@@ -239,6 +279,16 @@ const commands = [
     type: ApplicationCommandType.ChatInput
   },
   {
+    name: 'health',
+    description: 'Health check and uptime for monitoring',
+    type: ApplicationCommandType.ChatInput
+  },
+  {
+    name: 'reserved',
+    description: 'List reserved badge numbers (skipped during auto-assignment)',
+    type: ApplicationCommandType.ChatInput
+  },
+  {
     name: 'permissions',
     description: 'Show command permissions and your current access',
     type: ApplicationCommandType.ChatInput
@@ -251,6 +301,8 @@ const commandPermissions = {
   // Basic commands - everyone can use
   'ping': [],
   'status': [],
+  'health': [],
+  'reserved': [],
   
   // Management commands - require specific roles
   'validate': ['director', 'management','admin', 'moderator'],
@@ -464,20 +516,34 @@ function stopStatusCycling() {
 let memberNumbers = new Map();
 let nextNumber = config.startingNumber;
 
+function getReservedNumbers() {
+  return (config.reservedNumbers || []).filter(n => typeof n === 'number' && n >= 0);
+}
 
+function getNextAvailableNumber() {
+  const reserved = getReservedNumbers();
+  while (reserved.includes(nextNumber)) {
+    nextNumber++;
+  }
+  return nextNumber++;
+}
 
 // Validate and correct nextNumber
 async function validateNextNumber() {
   try {
     if (memberNumbers.size === 0) {
       nextNumber = config.startingNumber;
-      console.log(`No members found, setting nextNumber to ${config.startingNumber}`);
+      const reserved = getReservedNumbers();
+      while (reserved.includes(nextNumber)) nextNumber++;
+      console.log(`No members found, setting nextNumber to ${nextNumber}`);
       await updateNextNumberInDatabase();
       return;
     }
 
     const highestExisting = Math.max(...Array.from(memberNumbers.values()));
-    const expectedNext = Math.max(highestExisting + 1, config.startingNumber);
+    let expectedNext = Math.max(highestExisting + 1, config.startingNumber);
+    const reserved = getReservedNumbers();
+    while (reserved.includes(expectedNext)) expectedNext++;
 
     if (nextNumber !== expectedNext) {
       console.log(`🔧 Correcting nextNumber from ${nextNumber} to ${expectedNext}`);
@@ -547,6 +613,8 @@ async function loadMemberNumbers() {
     });
 
     nextNumber = Math.max(highestNumber + 1, config.startingNumber);
+    const reserved = getReservedNumbers();
+    while (reserved.includes(nextNumber)) nextNumber++;
     console.log(`Loaded ${memberNumbers.size} members, nextNumber: ${nextNumber}`);
 
     // Validate and correct if needed
@@ -798,13 +866,13 @@ async function assignNumberToMember(member) {
     // Check if member can be managed by the bot
     if (!canManageMember(member)) {
       console.log(`⚠️ Member ${member.user.tag} cannot be managed by bot. Assigning number without nickname update.`);
-      const number = nextNumber++;
+      const number = getNextAvailableNumber();
       await assignNumberWithoutNickname(member, number);
       return;
     }
 
-    // Assign next available number (only for new members)
-    const number = nextNumber++;
+    // Assign next available number (only for new members, skipping reserved)
+    const number = getNextAvailableNumber();
     memberNumbers.set(member.id, number);
     
     // Update member's nickname
@@ -1021,14 +1089,13 @@ client.once(Events.ClientReady, async () => {
       role.members.forEach(member => {
         assignNumberToMember(member);
       });
+      // Check for members who should have numbers removed due to skip roles
+      role.members.forEach(member => {
+        if (memberNumbers.has(member.id) && shouldRemoveNumber(member)) {
+          removeNumberFromMember(member);
+        }
+      });
     }
-    
-    // Check for members who should have numbers removed due to skip roles
-    role.members.forEach(member => {
-      if (memberNumbers.has(member.id) && shouldRemoveNumber(member)) {
-        removeNumberFromMember(member);
-      }
-    });
   }
 });
 
@@ -1199,12 +1266,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
      });
      return;
    }
+
+   // Check rate limit
+   const rateLimitResult = isRateLimited(interaction.user.id, interaction.commandName);
+   if (rateLimitResult) {
+     console.log(`⏱️ Rate limited: ${interaction.user.tag} tried /${interaction.commandName}`);
+     await interaction.reply({
+       content: `⏱️ **Rate limited.** Please wait ${rateLimitResult.retryAfter} seconds before using commands again.`,
+       flags: 64
+     });
+     return;
+   }
   
   console.log(`✅ Permission granted: ${interaction.user.tag} using /${interaction.commandName}`);
   
   try {
     switch (interaction.commandName) {
       case 'status':
+        const reservedList = getReservedNumbers();
+        const reservedStr = reservedList.length > 0 ? reservedList.join(', ') : 'None';
         const embed = {
           color: 0x00ff00,
           title: '🤖 Bot Status Information',
@@ -1212,6 +1292,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
             {
               name: '📊 Member Statistics',
               value: `**Total Members with Numbers:** ${memberNumbers.size}\n**Next Number to Assign:** ${nextNumber}`,
+              inline: true
+            },
+            {
+              name: '🔒 Reserved Numbers',
+              value: reservedStr,
               inline: true
             },
             {
@@ -1455,6 +1540,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
              let newNumber = newBadgeNumber !== null ? newBadgeNumber : currentNumber;
              let finalUsername = newUsername !== null ? newUsername : currentUsername;
+             if (newUsername === null) {
+               try {
+                 const [rows] = await pool.execute(
+                   'SELECT username FROM member_numbers WHERE member_id = ?',
+                   [editUser.id]
+                 );
+                 if (rows.length > 0) finalUsername = rows[0].username;
+               } catch (err) {
+                 console.error(`Error fetching stored username for ${editUser.tag}:`, err);
+               }
+             }
 
              // Check if the new badge number is already taken by another user
              if (newNumber !== currentNumber) {
@@ -1480,10 +1576,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
                console.log(`✅ Badge number updated for ${editUser.tag} from ${currentNumber} to ${newNumber}`);
              }
 
-             // Update database if username changed
-             if (newUsername !== null) {
+             // Update database when badge number or username changed
+             if (newNumber !== currentNumber || newUsername !== null) {
                await updateUserInDatabase(editUser.id, newNumber, finalUsername);
-               console.log(`✅ Username updated for ${editUser.tag} to: ${finalUsername}`);
+               if (newUsername !== null) {
+                 console.log(`✅ Username updated for ${editUser.tag} to: ${finalUsername}`);
+               }
+               if (newNumber !== currentNumber) {
+                 console.log(`✅ Badge number updated in database for ${editUser.tag}`);
+               }
              }
 
              // Update nickname if needed
@@ -1744,8 +1845,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
           badgeNumberToAssign = requestedBadgeNumber;
         } else {
-          // Use the next available number
-          badgeNumberToAssign = nextNumber;
+          // Use the next available number (skips reserved)
+          badgeNumberToAssign = getNextAvailableNumber();
         }
 
         // Determine the username to store
@@ -1773,9 +1874,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
              }
            }
           
-          // Update next number if we used the next available
+          // Update next number in DB if we used the next available (getNextAvailableNumber already incremented)
           if (requestedBadgeNumber === null) {
-            nextNumber++;
             await updateNextNumberInDatabase();
           }
           
@@ -2160,6 +2260,59 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ embeds: [pingEmbed] });
         console.log(`✅ Ping command responded to ${interaction.user.tag}`);
         break;
+
+      case 'health':
+        const uptimeSec = Math.floor(process.uptime());
+        const days = Math.floor(uptimeSec / 86400);
+        const hours = Math.floor((uptimeSec % 86400) / 3600);
+        const mins = Math.floor((uptimeSec % 3600) / 60);
+        const secs = uptimeSec % 60;
+        const uptimeStr = [days && `${days}d`, hours && `${hours}h`, mins && `${mins}m`, `${secs}s`].filter(Boolean).join(' ');
+
+        let dbStatus = '❌ Unknown';
+        try {
+          await pool.execute('SELECT 1');
+          dbStatus = '✅ Connected';
+        } catch (dbErr) {
+          dbStatus = `❌ Error: ${dbErr.message}`;
+        }
+
+        const wsLatency = client.ws.ping;
+        const healthEmbed = createInfoEmbed(
+          'Health Check',
+          'Bot health status for monitoring.',
+          [
+            { name: 'Status', value: '✅ Online', inline: true },
+            { name: 'Uptime', value: uptimeStr, inline: true },
+            { name: 'Discord Latency', value: `${wsLatency >= 0 ? wsLatency : '—'} ms`, inline: true },
+            { name: 'Database', value: dbStatus, inline: false }
+          ]
+        );
+        await interaction.reply({ embeds: [healthEmbed] });
+        break;
+
+      case 'reserved':
+        const reserved = getReservedNumbers();
+        const reservedEmbed = createInfoEmbed(
+          'Reserved Badge Numbers',
+          reserved.length > 0
+            ? 'These numbers are skipped during auto-assignment. Assign them manually via `/adduser` for special members.'
+            : 'No numbers are currently reserved.',
+          [
+            {
+              name: 'Reserved Numbers',
+              value: reserved.length > 0 ? reserved.sort((a, b) => a - b).join(', ') : '—',
+              inline: false
+            },
+            {
+              name: 'Next Auto-Assign',
+              value: `${nextNumber}`,
+              inline: true
+            }
+          ]
+        );
+        await interaction.reply({ embeds: [reservedEmbed] });
+        break;
         
              case 'permissions':
          const userRoles = interaction.member.roles.cache.map(role => role.name).join(', ');
@@ -2217,10 +2370,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
      console.error(`Error handling slash command ${interaction.commandName}:`, error);
      try {
        const errorEmbed = createErrorEmbed('Command Error', 'An error occurred while processing the command.');
-       await interaction.reply({ 
-         embeds: [errorEmbed],
-         flags: 64 // 64 = ephemeral flag
-       });
+       if (interaction.replied || interaction.deferred) {
+         await interaction.editReply({ embeds: [errorEmbed] });
+       } else {
+         await interaction.reply({ embeds: [errorEmbed], flags: 64 });
+       }
      } catch (replyError) {
        console.error('Failed to send error reply:', replyError);
      }
